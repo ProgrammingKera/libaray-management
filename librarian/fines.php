@@ -80,13 +80,40 @@ if (isset($_POST['record_payment'])) {
     }
 }
 
+$today = date('Y-m-d');
+$overdueSql = "
+    SELECT ib.id as issued_book_id, ib.user_id, b.title, DATEDIFF(?, ib.return_date) as days_overdue
+    FROM issued_books ib
+    JOIN books b ON ib.book_id = b.id
+    WHERE ib.status = 'issued' AND ? > ib.return_date
+      AND NOT EXISTS (
+          SELECT 1 FROM fines f WHERE f.issued_book_id = ib.id
+      )
+";
+$stmt = $conn->prepare($overdueSql);
+$stmt->bind_param("ss", $today, $today);
+$stmt->execute();
+$result = $stmt->get_result();
+
+while ($row = $result->fetch_assoc()) {
+    $fineAmount = $row['days_overdue'] * 1.00; // $1 per day
+    $reason = "Late return of book '{$row['title']}'";
+    $insertFine = $conn->prepare("
+        INSERT INTO fines (issued_book_id, user_id, amount, reason, status)
+        VALUES (?, ?, ?, ?, 'pending')
+    ");
+    $insertFine->bind_param("iids", $row['issued_book_id'], $row['user_id'], $fineAmount, $reason);
+    $insertFine->execute();
+}
+
 // Handle search and filtering
 $search = isset($_GET['search']) ? trim($_GET['search']) : '';
 $status = isset($_GET['status']) ? trim($_GET['status']) : '';
 
 // Build the query
 $sql = "
-    SELECT f.*, u.name as user_name, b.title as book_title, ib.issue_date, ib.return_date, ib.actual_return_date
+    SELECT f.*, u.name as user_name, b.title as book_title, ib.issue_date, ib.return_date, ib.actual_return_date,
+           DATEDIFF(COALESCE(ib.actual_return_date, CURRENT_DATE), ib.return_date) as days_overdue
     FROM fines f
     JOIN issued_books ib ON f.issued_book_id = ib.id
     JOIN books b ON ib.book_id = b.id
@@ -209,20 +236,14 @@ while ($row = $result->fetch_assoc()) {
                             if ($fine['actual_return_date']) {
                                 echo date('M d, Y', strtotime($fine['actual_return_date']));
                             } else {
-                                echo 'Not returned';
+                                echo '<span class="badge badge-warning">Not Returned</span>';
                             }
                             ?>
                         </td>
                         <td>
                             <?php
-                            $dueDate = new DateTime($fine['return_date']);
-                            $returnDate = $fine['actual_return_date'] 
-                                ? new DateTime($fine['actual_return_date']) 
-                                : new DateTime();
-                            
-                            if ($returnDate > $dueDate) {
-                                $diff = $returnDate->diff($dueDate);
-                                echo $diff->days . ' days';
+                            if ($fine['days_overdue'] > 0) {
+                                echo '<span class="badge badge-danger">' . $fine['days_overdue'] . ' days</span>';
                             } else {
                                 echo '0 days';
                             }
@@ -250,7 +271,7 @@ while ($row = $result->fetch_assoc()) {
                                             <button class="modal-close">&times;</button>
                                         </div>
                                         <div class="modal-body">
-                                            <p>You are recording a payment for the fine of <strong>$<?php echo number_format($fine['amount'], 2); ?></strong>
+                                            <p>Recording payment for fine of <strong>$<?php echo number_format($fine['amount'], 2); ?></strong>
                                                 issued to <strong><?php echo htmlspecialchars($fine['user_name']); ?></strong>
                                                 for the book <strong><?php echo htmlspecialchars($fine['book_title']); ?></strong>.</p>
                                             
@@ -285,15 +306,17 @@ while ($row = $result->fetch_assoc()) {
                                         </div>
                                     </div>
                                 </div>
-                            <?php else: ?>
-                                <a href="payment_details.php?fine_id=<?php echo $fine['id']; ?>" class="btn btn-sm btn-secondary">
+                            <?php endif; ?>
+                            
+                            <a href="fine_details.php?id=<?php echo $fine['id']; ?>" class="btn btn-sm btn-info" style="margin-top: 5px;">
+                                <i class="fas fa-info-circle"></i> Details
+                            </a>
+                            
+                            <?php if ($fine['status'] == 'paid'): ?>
+                                <a href="payment_details.php?fine_id=<?php echo $fine['id']; ?>" class="btn btn-sm btn-secondary" style="margin-top: 5px;">
                                     <i class="fas fa-receipt"></i> View Payment
                                 </a>
                             <?php endif; ?>
-                            
-                            <a href="fine_details.php?id=<?php echo $fine['id']; ?>" class="btn btn-sm btn-info">
-                                <i class="fas fa-info-circle"></i> Details
-                            </a>
                         </td>
                     </tr>
                 <?php endforeach; ?>
@@ -306,7 +329,30 @@ while ($row = $result->fetch_assoc()) {
     </table>
 </div>
 
-<?php
-// Include footer
-include_once '../includes/footer.php';
-?>
+<style>
+.badge-container {
+    display: flex;
+    gap: 15px;
+}
+
+.badge {
+    padding: 8px 16px;
+    border-radius: 20px;
+    font-weight: 600;
+}
+
+.table td {
+    vertical-align: middle;
+}
+
+.btn-group {
+    display: flex;
+    gap: 5px;
+}
+
+.btn {
+    white-space: nowrap;
+}
+</style>
+
+<?php include_once '../includes/footer.php'; ?>
