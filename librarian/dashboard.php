@@ -5,6 +5,97 @@ include_once '../includes/header.php';
 // Check if user is a librarian
 checkUserRole('librarian');
 
+// Process request approval/rejection
+if (isset($_GET['request_id']) && isset($_GET['action'])) {
+    $requestId = (int)$_GET['request_id'];
+    $action = $_GET['action'];
+    
+    // Start transaction
+    $conn->begin_transaction();
+    
+    try {
+        if ($action === 'approve') {
+            // Get request details
+            $stmt = $conn->prepare("
+                SELECT br.*, b.title, b.available_quantity, u.id as user_id, u.name as user_name 
+                FROM book_requests br
+                JOIN books b ON br.book_id = b.id
+                JOIN users u ON br.user_id = u.id
+                WHERE br.id = ?
+            ");
+            $stmt->bind_param("i", $requestId);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            if ($result->num_rows == 1) {
+                $request = $result->fetch_assoc();
+                
+                if ($request['available_quantity'] > 0) {
+                    // Update request status
+                    $stmt = $conn->prepare("UPDATE book_requests SET status = 'approved' WHERE id = ?");
+                    $stmt->bind_param("i", $requestId);
+                    $stmt->execute();
+                    
+                    // Generate return date (14 days from now)
+                    $returnDate = generateDueDate();
+                    
+                    // Create issued book record
+                    $stmt = $conn->prepare("
+                        INSERT INTO issued_books (book_id, user_id, return_date)
+                        VALUES (?, ?, ?)
+                    ");
+                    $stmt->bind_param("iis", $request['book_id'], $request['user_id'], $returnDate);
+                    $stmt->execute();
+                    
+                    // Update book availability
+                    updateBookAvailability($conn, $request['book_id'], 'issue');
+                    
+                    // Send notification to user
+                    $notificationMsg = "Your request for '{$request['title']}' has been approved. Please collect the book from the library.";
+                    sendNotification($conn, $request['user_id'], $notificationMsg);
+                    
+                    $message = "Request approved successfully.";
+                    $messageType = "success";
+                }
+            }
+        } elseif ($action === 'reject') {
+            // Get request details for notification
+            $stmt = $conn->prepare("
+                SELECT br.*, b.title, u.id as user_id
+                FROM book_requests br
+                JOIN books b ON br.book_id = b.id
+                JOIN users u ON br.user_id = u.id
+                WHERE br.id = ?
+            ");
+            $stmt->bind_param("i", $requestId);
+            $stmt->execute();
+            $result = $stmt->get_result();
+            
+            if ($result->num_rows == 1) {
+                $request = $result->fetch_assoc();
+                
+                // Update request status
+                $stmt = $conn->prepare("UPDATE book_requests SET status = 'rejected' WHERE id = ?");
+                $stmt->bind_param("i", $requestId);
+                $stmt->execute();
+                
+                // Send notification to user
+                $notificationMsg = "Your request for '{$request['title']}' has been rejected. Please contact the librarian for more information.";
+                sendNotification($conn, $request['user_id'], $notificationMsg);
+                
+                $message = "Request rejected successfully.";
+                $messageType = "success";
+            }
+        }
+        
+        $conn->commit();
+    } catch (Exception $e) {
+        $conn->rollback();
+        $message = "Error processing request: " . $e->getMessage();
+        $messageType = "danger";
+    }
+}
+
 // Get dashboard statistics
 $totalBooks = getTotalBooks($conn);
 $issuedBooks = getIssuedBooks($conn);
@@ -12,7 +103,7 @@ $totalUsers = getTotalUsers($conn);
 $pendingRequests = getPendingRequests($conn);
 $totalFines = getTotalUnpaidFines($conn);
 
-// Get recent activities (book issues, returns, new users, etc.)
+// Get recent activities
 $recentActivities = [];
 $sql = "
     (SELECT 'book_issued' as type, b.title as title, u.name as user_name, ib.issue_date as date
@@ -54,7 +145,7 @@ if ($result) {
     }
 }
 
-// Get books due for return today
+// Get books due today
 $today = date('Y-m-d');
 $dueTodayBooks = [];
 $sql = "
@@ -62,11 +153,12 @@ $sql = "
     FROM issued_books ib
     JOIN books b ON ib.book_id = b.id
     JOIN users u ON ib.user_id = u.id
-    WHERE ib.return_date = ? AND ib.status = 'issued'
+    WHERE DATE(ib.return_date) = CURRENT_DATE()
+    AND ib.status = 'issued'
     ORDER BY ib.return_date ASC
 ";
+
 $stmt = $conn->prepare($sql);
-$stmt->bind_param("s", $today);
 $stmt->execute();
 $result = $stmt->get_result();
 if ($result) {
@@ -83,7 +175,8 @@ $sql = "
     FROM issued_books ib
     JOIN books b ON ib.book_id = b.id
     JOIN users u ON ib.user_id = u.id
-    WHERE ib.return_date < CURRENT_DATE AND ib.status = 'issued'
+    WHERE ib.return_date < CURRENT_DATE
+    AND ib.status = 'issued'
     ORDER BY ib.return_date ASC
 ";
 $result = $conn->query($sql);
@@ -95,6 +188,12 @@ if ($result) {
 ?>
 
 <h1 class="page-title">Librarian Dashboard</h1>
+
+<?php if (isset($message)): ?>
+    <div class="alert alert-<?php echo $messageType; ?>">
+        <?php echo $message; ?>
+    </div>
+<?php endif; ?>
 
 <!-- Stats Cards -->
 <div class="stats-container">
@@ -233,8 +332,8 @@ if ($result) {
                                         <td><?php echo $row['user_name']; ?></td>
                                         <td><?php echo date('M d, Y', strtotime($row['request_date'])); ?></td>
                                         <td>
-                                            <a href="process_request.php?id=<?php echo $row['id']; ?>&action=approve" class="btn btn-sm btn-success">Approve</a>
-                                            <a href="process_request.php?id=<?php echo $row['id']; ?>&action=reject" class="btn btn-sm btn-danger">Reject</a>
+                                            <a href="?request_id=<?php echo $row['id']; ?>&action=approve" class="btn btn-sm btn-success">Approve</a>
+                                            <a href="?request_id=<?php echo $row['id']; ?>&action=reject" class="btn btn-sm btn-danger">Reject</a>
                                         </td>
                                     </tr>
                                 <?php endwhile; ?>
@@ -271,15 +370,17 @@ if ($result) {
                                     <th>Book</th>
                                     <th>User</th>
                                     <th>Issue Date</th>
+                                    <th>Due Date</th>
                                     <th>Action</th>
                                 </tr>
                             </thead>
                             <tbody>
                                 <?php foreach ($dueTodayBooks as $book): ?>
                                     <tr>
-                                        <td><?php echo $book['title']; ?></td>
-                                        <td><?php echo $book['user_name']; ?></td>
+                                        <td><?php echo htmlspecialchars($book['title']); ?></td>
+                                        <td><?php echo htmlspecialchars($book['user_name']); ?></td>
                                         <td><?php echo date('M d, Y', strtotime($book['issue_date'])); ?></td>
+                                        <td><?php echo date('M d, Y', strtotime($book['return_date'])); ?></td>
                                         <td>
                                             <a href="process_return.php?id=<?php echo $book['id']; ?>" class="btn btn-sm btn-primary">Process Return</a>
                                         </td>
@@ -309,6 +410,7 @@ if ($result) {
                                 <tr>
                                     <th>Book</th>
                                     <th>User</th>
+                                    <th>Due Date</th>
                                     <th>Days Overdue</th>
                                     <th>Action</th>
                                 </tr>
@@ -316,14 +418,12 @@ if ($result) {
                             <tbody>
                                 <?php foreach ($overdueBooks as $book): ?>
                                     <tr>
-                                        <td><?php echo $book['title']; ?></td>
-                                        <td><?php echo $book['user_name']; ?></td>
-                                        <td>
-                                            <span class="badge badge-danger"><?php echo $book['days_overdue']; ?> days</span>
-                                        </td>
+                                        <td><?php echo htmlspecialchars($book['title']); ?></td>
+                                        <td><?php echo htmlspecialchars($book['user_name']); ?></td>
+                                        <td><?php echo date('M d, Y', strtotime($book['return_date'])); ?></td>
+                                        <td><?php echo $book['days_overdue']; ?> days</td>
                                         <td>
                                             <a href="process_return.php?id=<?php echo $book['id']; ?>" class="btn btn-sm btn-primary">Process Return</a>
-                                            <a href="send_reminder.php?id=<?php echo $book['id']; ?>" class="btn btn-sm btn-warning">Send Reminder</a>
                                         </td>
                                     </tr>
                                 <?php endforeach; ?>
@@ -344,7 +444,4 @@ if ($result) {
     </div>
 </div>
 
-<?php
-// Include footer
-include_once '../includes/footer.php';
-?>
+<?php include_once '../includes/footer.php'; ?>
